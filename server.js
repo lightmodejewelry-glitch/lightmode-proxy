@@ -10,13 +10,10 @@ const jobs = {};
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// ── PREPARAR IMAGEN (solo descarga y redimensiona) ────────────
+// ── PREPARAR IMAGEN ───────────────────────────────────────────
 app.post('/img2img-prepare', async (req, res) => {
   const { imageUrl, jobId } = req.body;
-
-  if (!imageUrl || !jobId) {
-    return res.status(400).json({ error: 'Faltan parámetros' });
-  }
+  if (!imageUrl || !jobId) return res.status(400).json({ error: 'Faltan parámetros' });
 
   jobs[jobId] = { status: 'preparing' };
   res.json({ ok: true, jobId });
@@ -25,14 +22,11 @@ app.post('/img2img-prepare', async (req, res) => {
     try {
       const imgRes    = await fetch(imageUrl);
       const imgBuffer = await imgRes.buffer();
-
-      const image = await Jimp.read(imgBuffer);
+      const image     = await Jimp.read(imgBuffer);
       image.cover(1024, 1024);
       const resizedBuffer = await image.getBufferAsync(Jimp.MIME_PNG);
-
       console.log(`Job ${jobId}: imagen preparada 1024x1024`);
       jobs[jobId] = { status: 'ready', buffer: resizedBuffer };
-
       setTimeout(() => { delete jobs[jobId]; }, 30 * 60 * 1000);
     } catch(e) {
       console.error(`Job ${jobId} prepare error:`, e.message);
@@ -44,30 +38,18 @@ app.post('/img2img-prepare', async (req, res) => {
 // ── GENERAR CON IMAGEN PREPARADA ──────────────────────────────
 app.post('/img2img-generate', async (req, res) => {
   const { prompt, stabilityKey, strength, jobId } = req.body;
-
-  if (!prompt || !stabilityKey || !jobId) {
-    return res.status(400).json({ error: 'Faltan parámetros' });
-  }
+  if (!prompt || !stabilityKey || !jobId) return res.status(400).json({ error: 'Faltan parámetros' });
 
   const job = jobs[jobId];
-
-  if (!job) {
-    return res.status(400).json({ error: 'Job no encontrado' });
-  }
-
-  if (job.status === 'error') {
-    return res.status(400).json({ error: job.error });
-  }
+  if (!job)              return res.status(400).json({ error: 'Job no encontrado' });
+  if (job.status === 'error') return res.status(400).json({ error: job.error });
 
   const genJobId = jobId + '_gen_' + Date.now();
   jobs[genJobId] = { status: 'processing' };
   res.json({ ok: true, genJobId });
 
   const bufferToUse = job.buffer;
-
-  (async () => {
-    await generarConBuffer(bufferToUse, prompt, stabilityKey, strength, genJobId);
-  })();
+  (async () => { await generarConBuffer(bufferToUse, prompt, stabilityKey, strength, genJobId); })();
 });
 
 // ── CONSULTAR RESULTADO ───────────────────────────────────────
@@ -110,11 +92,7 @@ async function generarConBuffer(buffer, prompt, stabilityKey, strength, genJobId
       'https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/image-to-image',
       {
         method:  'POST',
-        headers: {
-          ...form.getHeaders(),
-          Authorization: 'Bearer ' + stabilityKey,
-          Accept: 'application/json'
-        },
+        headers: { ...form.getHeaders(), Authorization: 'Bearer ' + stabilityKey, Accept: 'application/json' },
         body: form
       }
     );
@@ -143,7 +121,5 @@ async function generarConBuffer(buffer, prompt, stabilityKey, strength, genJobId
   }
 }
 
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Servidor corriendo en puerto', PORT));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor corriendo en puerto', PORT));
