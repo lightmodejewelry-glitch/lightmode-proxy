@@ -2,7 +2,7 @@ const express  = require('express');
 const fetch    = require('node-fetch');
 const FormData = require('form-data');
 const cors     = require('cors');
-const sharp    = require('sharp');
+const Jimp     = require('jimp');
 
 const app = express();
 app.use(cors());
@@ -27,20 +27,18 @@ app.post('/img2img', async (req, res) => {
       "blurry, low quality, distorted, ugly, text, watermark, " +
       "dark background, flat lighting, person, hand, cropped, cut off";
 
-    // Descargar imagen en binario real
+    // Descargar imagen
     const imgRes    = await fetch(imageUrl);
     const imgBuffer = await imgRes.buffer();
 
-    // Redimensionar a 1024x1024 manteniendo proporción con relleno
-    const resizedBuffer = await sharp(imgBuffer)
-      .resize(1024, 1024, {
-        fit: 'cover',       // recorta para llenar exactamente 1024x1024
-        position: 'center'
-      })
-      .jpeg({ quality: 90 })
-      .toBuffer();
+    // Redimensionar a 1024x1024 con Jimp
+    const image = await Jimp.read(imgBuffer);
+    image.cover(1024, 1024);
+    const resizedBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
 
-    // Construir multipart con binario redimensionado
+    console.log('Imagen redimensionada a 1024x1024');
+
+    // Construir multipart
     const form = new FormData();
     form.append('init_image',              resizedBuffer, { filename: 'reference.jpg', contentType: 'image/jpeg' });
     form.append('init_image_mode',         'IMAGE_STRENGTH');
@@ -86,9 +84,6 @@ app.post('/img2img', async (req, res) => {
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Servidor corriendo en puerto', PORT));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor corriendo en puerto', PORT));
