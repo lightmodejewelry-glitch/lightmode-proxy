@@ -2,6 +2,7 @@ const express  = require('express');
 const fetch    = require('node-fetch');
 const FormData = require('form-data');
 const cors     = require('cors');
+const sharp    = require('sharp');
 
 const app = express();
 app.use(cors());
@@ -30,9 +31,18 @@ app.post('/img2img', async (req, res) => {
     const imgRes    = await fetch(imageUrl);
     const imgBuffer = await imgRes.buffer();
 
-    // Construir multipart con binario real
+    // Redimensionar a 1024x1024 manteniendo proporción con relleno
+    const resizedBuffer = await sharp(imgBuffer)
+      .resize(1024, 1024, {
+        fit: 'cover',       // recorta para llenar exactamente 1024x1024
+        position: 'center'
+      })
+      .jpeg({ quality: 90 })
+      .toBuffer();
+
+    // Construir multipart con binario redimensionado
     const form = new FormData();
-    form.append('init_image',              imgBuffer, { filename: 'reference.jpg', contentType: 'image/jpeg' });
+    form.append('init_image',              resizedBuffer, { filename: 'reference.jpg', contentType: 'image/jpeg' });
     form.append('init_image_mode',         'IMAGE_STRENGTH');
     form.append('image_strength',          String(strength || 0.45));
     form.append('text_prompts[0][text]',   promptFinal);
@@ -76,6 +86,9 @@ app.post('/img2img', async (req, res) => {
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('Servidor corriendo en puerto', PORT));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor corriendo en puerto', PORT));
