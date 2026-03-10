@@ -34,13 +34,13 @@ app.post('/img2img', async (req, res) => {
     // Redimensionar a 1024x1024 con Jimp
     const image = await Jimp.read(imgBuffer);
     image.cover(1024, 1024);
-    const resizedBuffer = await image.getBufferAsync(Jimp.MIME_JPEG);
+    const resizedBuffer = await image.getBufferAsync(Jimp.MIME_PNG);
 
     console.log('Imagen redimensionada a 1024x1024');
 
     // Construir multipart
     const form = new FormData();
-    form.append('init_image',              resizedBuffer, { filename: 'reference.jpg', contentType: 'image/jpeg' });
+    form.append('init_image',              resizedBuffer, { filename: 'reference.jpg', contentType: 'image/png' });
     form.append('init_image_mode',         'IMAGE_STRENGTH');
     form.append('image_strength',          String(strength || 0.45));
     form.append('text_prompts[0][text]',   promptFinal);
