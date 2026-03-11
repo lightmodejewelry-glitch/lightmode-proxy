@@ -10,7 +10,6 @@ const jobs = {};
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// ── GENERATE TODO EN UNO ──────────────────────────────────────
 app.post('/img2img', async (req, res) => {
   const { imageUrl, prompt, stabilityKey, strength } = req.body;
   if (!imageUrl || !prompt || !stabilityKey) {
@@ -23,16 +22,13 @@ app.post('/img2img', async (req, res) => {
 
   (async () => {
     try {
-      // 1. Descargar imagen
       const imgRes    = await fetch(imageUrl);
       const imgBuffer = await imgRes.buffer();
 
-      // 2. Redimensionar a 1024x1024
       const image = await Jimp.read(imgBuffer);
       image.cover(1024, 1024);
       const resizedBuffer = await image.getBufferAsync(Jimp.MIME_PNG);
 
-      // 3. Generar con Stability
       const promptFinal = prompt +
         ", placed on white marble surface, warm golden sunset lighting, " +
         "dramatic side light, luxury jewelry photography, editorial style, " +
@@ -87,7 +83,6 @@ app.post('/img2img', async (req, res) => {
   })();
 });
 
-// ── RESULTADO ─────────────────────────────────────────────────
 app.get('/img2img-result/:jobId', (req, res) => {
   const job = jobs[req.params.jobId];
   if (!job) return res.json({ status: 'not_found' });
@@ -98,6 +93,3 @@ app.get('/health', (req, res) => res.json({ ok: true }));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor en puerto', PORT));
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Servidor corriendo en puerto', PORT));
