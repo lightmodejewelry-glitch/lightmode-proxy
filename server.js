@@ -10,6 +10,7 @@ const jobs = {};
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// Lanza generación y responde jobId inmediatamente
 app.post('/img2img', async (req, res) => {
   const { imageUrl, prompt, stabilityKey, strength } = req.body;
   if (!imageUrl || !prompt || !stabilityKey) {
@@ -18,8 +19,11 @@ app.post('/img2img', async (req, res) => {
 
   const jobId = 'job_' + Date.now();
   jobs[jobId] = { status: 'processing' };
+
+  // Responde INMEDIATAMENTE antes de procesar
   res.json({ ok: true, jobId });
 
+  // Procesa en background
   (async () => {
     try {
       const imgRes    = await fetch(imageUrl);
@@ -63,6 +67,7 @@ app.post('/img2img', async (req, res) => {
 
       if (!stabRes.ok) {
         const errText = await stabRes.text();
+        console.error('Stability error:', errText);
         jobs[jobId] = { status: 'error', error: errText };
         return;
       }
@@ -73,6 +78,7 @@ app.post('/img2img', async (req, res) => {
         return;
       }
 
+      console.log('Job completado:', jobId);
       jobs[jobId] = { status: 'done', base64: data.artifacts[0].base64 };
       setTimeout(() => { delete jobs[jobId]; }, 10 * 60 * 1000);
 
@@ -83,6 +89,7 @@ app.post('/img2img', async (req, res) => {
   })();
 });
 
+// Consultar resultado
 app.get('/img2img-result/:jobId', (req, res) => {
   const job = jobs[req.params.jobId];
   if (!job) return res.json({ status: 'not_found' });
