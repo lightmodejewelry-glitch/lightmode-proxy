@@ -10,6 +10,7 @@ const jobs = {};
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
+// ── IMG2IMG ───────────────────────────────────────────────────
 // Lanza generación y responde jobId inmediatamente
 app.post('/img2img', async (req, res) => {
   const { imageUrl, prompt, stabilityKey, strength } = req.body;
@@ -19,16 +20,12 @@ app.post('/img2img', async (req, res) => {
 
   const jobId = 'job_' + Date.now();
   jobs[jobId] = { status: 'processing' };
-
-  // Responde INMEDIATAMENTE antes de procesar
   res.json({ ok: true, jobId });
 
-  // Procesa en background
   (async () => {
     try {
       const imgRes    = await fetch(imageUrl);
       const imgBuffer = await imgRes.buffer();
-
       const image = await Jimp.read(imgBuffer);
       image.cover(1024, 1024);
       const resizedBuffer = await image.getBufferAsync(Jimp.MIME_PNG);
@@ -67,7 +64,7 @@ app.post('/img2img', async (req, res) => {
 
       if (!stabRes.ok) {
         const errText = await stabRes.text();
-        console.error('Stability error:', errText);
+        console.error('Stability img2img error:', errText);
         jobs[jobId] = { status: 'error', error: errText };
         return;
       }
@@ -78,18 +75,95 @@ app.post('/img2img', async (req, res) => {
         return;
       }
 
-      console.log('Job completado:', jobId);
+      console.log('img2img completado:', jobId);
       jobs[jobId] = { status: 'done', base64: data.artifacts[0].base64 };
       setTimeout(() => { delete jobs[jobId]; }, 10 * 60 * 1000);
 
     } catch(e) {
-      console.error('Job error:', e.message);
+      console.error('img2img error:', e.message);
       jobs[jobId] = { status: 'error', error: e.message };
     }
   })();
 });
 
-// Consultar resultado
+// ── TXT2IMG ───────────────────────────────────────────────────
+// Nuevo endpoint: igual que img2img pero para texto-a-imagen.
+// Responde jobId inmediatamente y procesa en background,
+// evitando el timeout de 14s de Wix/Velo.
+app.post('/txt2img', async (req, res) => {
+  const { prompt, ambienteSuffix, negativePrompt, stabilityKey, variacion } = req.body;
+  if (!prompt || !stabilityKey) {
+    return res.status(400).json({ error: 'Faltan parámetros' });
+  }
+
+  const jobId = 'job_' + Date.now() + '_' + (variacion || '0');
+  jobs[jobId] = { status: 'processing' };
+  res.json({ ok: true, jobId });
+
+  (async () => {
+    try {
+      // El sufijo de ambiente viene del backend de Velo (ya diferenciado por variación)
+      const promptFinal = prompt + (ambienteSuffix || '');
+
+      const negative = negativePrompt ||
+        "blurry, low quality, distorted, deformed, ugly, text, watermark, logo, " +
+        "person, hand, finger, body part, face, skin, " +
+        "dark muddy background, flat lighting, oversaturated, cartoon, illustration, painting, " +
+        "abstract, surreal, fantasy, unrealistic proportions, " +
+        "cropped jewelry, partial view, cut off, multiple pieces, duplicate, " +
+        "broken metal, melted, warped, " +
+        "cheap looking, plastic, toy jewelry, costume jewelry";
+
+      const body = JSON.stringify({
+        text_prompts: [
+          { text: promptFinal, weight: 1   },
+          { text: negative,    weight: -1  }
+        ],
+        cfg_scale: 8,
+        height:    1024,
+        width:     1024,
+        steps:     35,
+        samples:   1
+      });
+
+      const stabRes = await fetch(
+        'https://api.stability.ai/v1/generation/stable-diffusion-xl-1024-v1-0/text-to-image',
+        {
+          method:  'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization:  'Bearer ' + stabilityKey,
+            Accept:         'application/json'
+          },
+          body
+        }
+      );
+
+      if (!stabRes.ok) {
+        const errText = await stabRes.text();
+        console.error('Stability txt2img error:', errText);
+        jobs[jobId] = { status: 'error', error: errText };
+        return;
+      }
+
+      const data = await stabRes.json();
+      if (!data.artifacts || !data.artifacts.length) {
+        jobs[jobId] = { status: 'error', error: 'Sin imagen de Stability' };
+        return;
+      }
+
+      console.log('txt2img completado:', jobId);
+      jobs[jobId] = { status: 'done', base64: data.artifacts[0].base64 };
+      setTimeout(() => { delete jobs[jobId]; }, 10 * 60 * 1000);
+
+    } catch(e) {
+      console.error('txt2img error:', e.message);
+      jobs[jobId] = { status: 'error', error: e.message };
+    }
+  })();
+});
+
+// ── CONSULTAR RESULTADO (compartido por img2img y txt2img) ────
 app.get('/img2img-result/:jobId', (req, res) => {
   const job = jobs[req.params.jobId];
   if (!job) return res.json({ status: 'not_found' });
@@ -97,6 +171,9 @@ app.get('/img2img-result/:jobId', (req, res) => {
 });
 
 app.get('/health', (req, res) => res.json({ ok: true }));
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log('Servidor en puerto', PORT));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor en puerto', PORT));
