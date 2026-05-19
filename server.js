@@ -1,14 +1,14 @@
-const express  = require('express');
-const fetch    = require('node-fetch');
+const express = require('express');
+const fetch = require('node-fetch');
 const FormData = require('form-data');
-const cors     = require('cors');
-const Jimp     = require('jimp');
+const cors = require('cors');
+const Jimp = require('jimp');
 
-const app  = express();
+const app = express();
 const jobs = {};
 
 app.use(cors());
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '20mb' }));
 
 process.on('unhandledRejection', (reason) => {
   console.error('Unhandled Rejection:', reason);
@@ -18,10 +18,79 @@ process.on('uncaughtException', (err) => {
   console.error('Uncaught Exception:', err);
 });
 
+async function fetchUrlAsBase64(url) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('No se pudo descargar la imagen generada');
+  const contentType = res.headers.get('content-type') || 'image/png';
+  const buffer = await res.buffer();
+  return {
+    base64: buffer.toString('base64'),
+    dataUrl: `data:${contentType};base64,${buffer.toString('base64')}`
+  };
+}
+
+async function imageUrlToDataUrl(imageUrl) {
+  const res = await fetch(imageUrl);
+  if (!res.ok) throw new Error('No se pudo descargar la imagen de referencia');
+
+  const contentType = res.headers.get('content-type') || 'image/png';
+  const buffer = await res.buffer();
+
+  // Normalizamos con Jimp para evitar formatos raros o imágenes demasiado grandes.
+  const image = await Jimp.read(buffer);
+  image.contain(1024, 1024);
+  const pngBuffer = await image.getBufferAsync(Jimp.MIME_PNG);
+
+  return `data:image/png;base64,${pngBuffer.toString('base64')}`;
+}
+
+async function runOpenAIImageEdit({ imageUrl, prompt, openaiKey, model }) {
+  const dataUrl = await imageUrlToDataUrl(imageUrl);
+
+  const body = JSON.stringify({
+    model: model || 'gpt-image-1',
+    images: [
+      { image_url: dataUrl }
+    ],
+    prompt,
+    n: 1,
+    size: '1024x1024',
+    output_format: 'png'
+  });
+
+  const openaiRes = await fetch('https://api.openai.com/v1/images/edits', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: 'Bearer ' + openaiKey
+    },
+    body
+  });
+
+  if (!openaiRes.ok) {
+    const errText = await openaiRes.text();
+    throw new Error(errText);
+  }
+
+  const data = await openaiRes.json();
+  const item = data?.data?.[0];
+
+  if (!item) throw new Error('OpenAI no devolvió imagen');
+
+  if (item.b64_json) return item.b64_json;
+
+  if (item.url) {
+    const converted = await fetchUrlAsBase64(item.url);
+    return converted.base64;
+  }
+
+  throw new Error('OpenAI no devolvió b64_json ni url');
+}
+
 async function runStabilityTxt2Img({ prompt, negativePrompt, stabilityKey }) {
   const negativeFinal =
     negativePrompt ||
-    "blurry, low quality, distorted, deformed, ugly, text, watermark, logo, person, hand, finger, body part, face, skin, dark muddy background, flat lighting, oversaturated, cartoon, illustration, painting, abstract, surreal, fantasy, unrealistic proportions, cropped jewelry, partial view, cut off, multiple pieces, duplicate, broken metal, melted, warped, cheap looking, plastic, toy jewelry, costume jewelry";
+    'blurry, low quality, distorted, deformed, ugly, text, watermark, logo, person, hand, finger, body part, face, skin, dark muddy background, flat lighting, oversaturated, cartoon, illustration, painting, abstract, surreal, fantasy, unrealistic proportions, cropped jewelry, partial view, cut off, multiple pieces, duplicate, broken metal, melted, warped, cheap looking, plastic, toy jewelry, costume jewelry';
 
   const body = JSON.stringify({
     text_prompts: [
@@ -70,14 +139,12 @@ async function runStabilityImg2Img({ imageUrl, prompt, negativePrompt, stability
 
   const imgBuffer = await imgRes.buffer();
   const image = await Jimp.read(imgBuffer);
-
   image.contain(1024, 1024);
-
   const resizedBuffer = await image.getBufferAsync(Jimp.MIME_PNG);
 
   const negativeFinal =
     negativePrompt ||
-    "blurry, low quality, distorted, deformed, ugly, watermark, logo, person, hand, cropped, cut off, broken chain, melted metal, impossible structure";
+    'blurry, low quality, distorted, deformed, ugly, watermark, logo, person, hand, cropped, cut off, broken chain, melted metal, impossible structure';
 
   const form = new FormData();
 
@@ -122,22 +189,74 @@ async function runStabilityImg2Img({ imageUrl, prompt, negativePrompt, stability
   return data.artifacts[0].base64;
 }
 
-// ── IMG2IMG SUAVE CON FALLBACK INTERNO A TXT2IMG ──────────────
-app.post('/img2img', async (req, res) => {
-  const { imageUrl, prompt, negativePrompt, stabilityKey, strength, variacion } = req.body;
+function createJob(prefix, variacion) {
+  const jobId = `${prefix}_${Date.now()}_${variacion || '0'}_${Math.floor(Math.random() * 10000)}`;
+  jobs[jobId] = { status: 'processing' };
+  return jobId;
+}
 
-  if (!imageUrl || !prompt || !stabilityKey) {
-    return res.status(400).json({ ok: false, error: 'Faltan parámetros img2img' });
+function finishJob(jobId, payload) {
+  jobs[jobId] = payload;
+  setTimeout(() => {
+    delete jobs[jobId];
+  }, 10 * 60 * 1000);
+}
+
+// ── OPENAI IMAGE EDIT — CON REFERENCIA ────────────────────────
+app.post('/openai-edit', async (req, res) => {
+  const { imageUrl, prompt, openaiKey, model, variacion } = req.body;
+
+  if (!imageUrl || !prompt || !openaiKey) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Faltan parámetros openai-edit'
+    });
   }
 
-  const jobId = 'job_img2img_' + Date.now() + '_' + (variacion || '0');
-  jobs[jobId] = { status: 'processing' };
+  const jobId = createJob('job_openai_edit', variacion);
   res.json({ ok: true, jobId });
 
   (async () => {
     try {
-      console.log('=== IMG2IMG SUAVE ===', jobId, 'strength:', strength || 0.20);
+      console.log('=== OPENAI IMAGE EDIT ===', jobId);
+      const base64 = await runOpenAIImageEdit({
+        imageUrl,
+        prompt,
+        openaiKey,
+        model: model || 'gpt-image-1'
+      });
 
+      finishJob(jobId, {
+        status: 'done',
+        base64
+      });
+    } catch (e) {
+      console.error('openai-edit error:', e.message);
+      finishJob(jobId, {
+        status: 'error',
+        error: e.message
+      });
+    }
+  })();
+});
+
+// ── IMG2IMG STABILITY — FALLBACK / COMPATIBILIDAD ─────────────
+app.post('/img2img', async (req, res) => {
+  const { imageUrl, prompt, negativePrompt, stabilityKey, strength, variacion } = req.body;
+
+  if (!imageUrl || !prompt || !stabilityKey) {
+    return res.status(400).json({
+      ok: false,
+      error: 'Faltan parámetros img2img'
+    });
+  }
+
+  const jobId = createJob('job_img2img', variacion);
+  res.json({ ok: true, jobId });
+
+  (async () => {
+    try {
+      console.log('=== STABILITY IMG2IMG ===', jobId);
       const base64 = await runStabilityImg2Img({
         imageUrl,
         prompt,
@@ -146,64 +265,53 @@ app.post('/img2img', async (req, res) => {
         strength: strength || 0.20
       });
 
-      jobs[jobId] = { status: 'done', base64 };
-      setTimeout(() => { delete jobs[jobId]; }, 10 * 60 * 1000);
-
+      finishJob(jobId, {
+        status: 'done',
+        base64
+      });
     } catch (e) {
-      console.error('img2img error, intentando fallback txt2img:', e.message);
-
-      try {
-        const fallbackPrompt =
-          prompt +
-          ' Fallback generation without image conditioning: preserve the compatible visual DNA described in the prompt, but prioritize the client brief and produce a coherent realistic jewelry product.';
-
-        const base64 = await runStabilityTxt2Img({
-          prompt: fallbackPrompt,
-          negativePrompt,
-          stabilityKey
-        });
-
-        jobs[jobId] = { status: 'done', base64, fallback: true };
-        setTimeout(() => { delete jobs[jobId]; }, 10 * 60 * 1000);
-
-      } catch (fallbackError) {
-        console.error('fallback txt2img error:', fallbackError.message);
-        jobs[jobId] = { status: 'error', error: fallbackError.message };
-      }
+      console.error('img2img error:', e.message);
+      finishJob(jobId, {
+        status: 'error',
+        error: e.message
+      });
     }
   })();
 });
 
-// ── TXT2IMG ORIGINAL ──────────────────────────────────────────
+// ── TXT2IMG STABILITY — SIN REFERENCIA ────────────────────────
 app.post('/txt2img', async (req, res) => {
   const { prompt, ambienteSuffix, negativePrompt, stabilityKey, variacion } = req.body;
 
   if (!prompt || !stabilityKey) {
-    return res.status(400).json({ ok: false, error: 'Faltan parámetros txt2img' });
+    return res.status(400).json({
+      ok: false,
+      error: 'Faltan parámetros txt2img'
+    });
   }
 
-  const jobId = 'job_txt2img_' + Date.now() + '_' + (variacion || '0');
-  jobs[jobId] = { status: 'processing' };
+  const jobId = createJob('job_txt2img', variacion);
   res.json({ ok: true, jobId });
 
   (async () => {
     try {
-      console.log('=== TXT2IMG ===', jobId);
-
-      const promptFinal = prompt + (ambienteSuffix || '');
-
+      console.log('=== STABILITY TXT2IMG ===', jobId);
       const base64 = await runStabilityTxt2Img({
-        prompt: promptFinal,
+        prompt: prompt + (ambienteSuffix || ''),
         negativePrompt,
         stabilityKey
       });
 
-      jobs[jobId] = { status: 'done', base64 };
-      setTimeout(() => { delete jobs[jobId]; }, 10 * 60 * 1000);
-
+      finishJob(jobId, {
+        status: 'done',
+        base64
+      });
     } catch (e) {
       console.error('txt2img error:', e.message);
-      jobs[jobId] = { status: 'error', error: e.message };
+      finishJob(jobId, {
+        status: 'error',
+        error: e.message
+      });
     }
   })();
 });
@@ -211,11 +319,20 @@ app.post('/txt2img', async (req, res) => {
 // ── CONSULTAR RESULTADO ───────────────────────────────────────
 app.get('/img2img-result/:jobId', (req, res) => {
   const job = jobs[req.params.jobId];
-  if (!job) return res.json({ status: 'not_found' });
+
+  if (!job) {
+    return res.json({ status: 'not_found' });
+  }
+
   res.json(job);
 });
 
-app.get('/health', (req, res) => res.json({ ok: true }));
+app.get('/health', (req, res) => {
+  res.json({ ok: true });
+});
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log('Servidor en puerto', PORT));
+
+app.listen(PORT, () => {
+  console.log('Servidor en puerto', PORT);
+});
