@@ -383,7 +383,7 @@ async function openaiEdit(dataUrl, prompt) {
   const res = await fetch('https://api.openai.com/v1/images/edits', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + OPENAI_KEY },
-    body: JSON.stringify({ model: 'gpt-image-1', images: [{ image_url: dataUrl }], prompt, n: 1, size: '1024x1024', output_format: 'png' }),
+    body: JSON.stringify({ model: 'gpt-image-1.5', images: [{ image_url: dataUrl }], prompt, n: 1, size: '1024x1024', output_format: 'png' }),
   });
   return leerImagenOpenAI(res);
 }
@@ -392,7 +392,7 @@ async function openaiGenerate(prompt) {
   const res = await fetch('https://api.openai.com/v1/images/generations', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + OPENAI_KEY },
-    body: JSON.stringify({ model: 'gpt-image-1', prompt, n: 1, size: '1024x1024', output_format: 'png' }),
+    body: JSON.stringify({ model: 'gpt-image-1.5', prompt, n: 1, size: '1024x1024', output_format: 'png' }),
   });
   return leerImagenOpenAI(res);
 }
