@@ -9,7 +9,7 @@
 //   STABILITY_API_KEY   (obligatoria para bocetos CON foto de referencia:
 //                        Stability trabaja directamente sobre la imagen)
 //   OPENAI_IMAGE_MODEL  (opcional, por defecto "gpt-image-1.5")
-//   STABILITY_STRENGTH  (opcional, 0.30–0.80, cuánto se aleja de la foto; por defecto 0.55)
+//   STABILITY_STRENGTH  (opcional, 0.30–0.80, cuánto se aleja de la foto; por defecto 0.72)
 //   RESEND_API_KEY      (para recibir las solicitudes por correo)
 //   LUZ_EMAIL_TO        (tu correo, donde llegan las solicitudes)
 //   LUZ_EMAIL_FROM      (opcional, por defecto "Luz <onboarding@resend.dev>")
@@ -23,7 +23,7 @@ const Jimp = require('jimp');
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
 const STABILITY_KEY = process.env.STABILITY_API_KEY || '';
 const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1.5';
-const STABILITY_STRENGTH = Math.min(0.8, Math.max(0.3, parseFloat(process.env.STABILITY_STRENGTH) || 0.55));
+const STABILITY_STRENGTH = Math.min(0.8, Math.max(0.3, parseFloat(process.env.STABILITY_STRENGTH) || 0.72));
 const RESEND_KEY = process.env.RESEND_API_KEY || '';
 const EMAIL_TO = process.env.LUZ_EMAIL_TO || '';
 const EMAIL_FROM = process.env.LUZ_EMAIL_FROM || 'Luz <onboarding@resend.dev>';
@@ -130,8 +130,12 @@ async function normalizarReferencia(dataUrl) {
   if (!dataUrl || typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) return '';
   const base64 = dataUrl.split(',')[1] || '';
   const image = await Jimp.read(Buffer.from(base64, 'base64'));
-  image.contain(1024, 1024);
-  const png = await image.getBufferAsync(Jimp.MIME_PNG);
+  // Rellena con el color de fondo de la propia foto (evita franjas grises/negras a los lados).
+  const fondo = image.getPixelColor(2, 2);
+  image.scaleToFit(1024, 1024);
+  const lienzo = new Jimp(1024, 1024, fondo);
+  lienzo.composite(image, Math.floor((1024 - image.bitmap.width) / 2), Math.floor((1024 - image.bitmap.height) / 2));
+  const png = await lienzo.getBufferAsync(Jimp.MIME_PNG);
   return `data:image/png;base64,${png.toString('base64')}`;
 }
 
@@ -429,7 +433,7 @@ async function stabilityTxt2Img(prompt, negativePrompt) {
 // strength bajo = más fiel a la foto; alto = más cambios. Cada variación se aleja un poco más.
 async function stabilityImg2Img(dataUrl, prompt, negativePrompt, variacion) {
   const base64 = dataUrl.split(',')[1] || '';
-  const offsets = [-0.08, 0, 0.08];
+  const offsets = [-0.07, 0, 0.07];
   const strength = Math.min(0.85, Math.max(0.25, STABILITY_STRENGTH + offsets[(variacion - 1) % 3]));
   const form = new FormData();
   form.append('image', new Blob([Buffer.from(base64, 'base64')], { type: 'image/png' }), 'referencia.png');
