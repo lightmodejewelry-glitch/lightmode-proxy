@@ -1,4 +1,4 @@
-// ============================================================
+============================================================
 // LightMode — Servidor de Luz (Render)
 // Reúne en un solo sitio lo que antes hacían el backend de Wix
 // y el proxy de Render. Las claves viven SOLO en las variables
@@ -14,6 +14,10 @@
 //   LUZ_EMAIL_TO        (tu correo, donde llegan las solicitudes)
 //   LUZ_EMAIL_FROM      (opcional, por defecto "Luz <onboarding@resend.dev>")
 //   ALLOWED_ORIGINS     (opcional, webs que pueden usar a Luz, separadas por comas)
+//   LUZ_SIGNING_SECRET  (obligatoria: la misma clave de firma que usa la página de Shopify)
+//   LUZ_LIMITE_DIARIO   (opcional, diseños por cliente y día; por defecto 2)
+//   UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN (opcionales: guardan el contador
+//                        aunque Render se reinicie; sin ellas el contador vive en memoria)
 // ============================================================
 const express = require('express');
 const fetch = require('node-fetch');
@@ -31,6 +35,13 @@ const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || 'https://lightmode-7709.
   .split(',')
   .map((s) => s.trim().replace(/\/$/, ''))
   .filter(Boolean);
+
+const crypto = require('crypto');
+const SIGNING_SECRET = process.env.LUZ_SIGNING_SECRET || '';
+const LIMITE_DIARIO = parseInt(process.env.LUZ_LIMITE_DIARIO, 10) || 2;
+const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
+const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
+const usosMemoria = {};
 
 const app = express();
 const jobs = {};
@@ -340,7 +351,7 @@ function construirPromptFinal(prompt, variacion, brief, usarReferencia) {
   const variacionesReferencia = [
     'Variation 1: stay closest to the reference piece, with the client changes applied cleanly. High polish finish.',
     'Variation 2: same piece as the reference with the client changes, slightly refined proportions and soft polished finish.',
-    'Variation 3: same piece as the reference with the client changes, with a subtle elegant detail on the finish. Keep the same single main motif, do not duplicate it.',
+    'Variation 3: keep the reference piece recognizable, but apply EVERY client change clearly and visibly, including any added letters, stones, symbols or new elements exactly where the client asked. Keep the same single main motif, do not duplicate it.',
   ];
   if (usarReferencia) variationInstructions.splice(0, 3, ...variacionesReferencia);
   const forbidden = Array.isArray(brief?.materiales_prohibidos) ? brief.materiales_prohibidos : [];
@@ -477,7 +488,25 @@ function finishJob(jobId, payload) {
 
 function lanzarBoceto(jobId, variacion, finalPrompt, negativePrompt, referencia) {
   (async () => {
-    // Camino 1 — CON referencia: Stability ve la foto y la transforma.
+    // Camino 1 — CON referencia. Bocetos 1 y 2: Stability (fiel a la foto).
+    // Boceto 3: OpenAI editando la foto real (añade mejor letras, piedras y elementos nuevos).
+    if (referencia && variacion === 3) {
+      try {
+        const base64 = await openaiEdit(referencia, finalPrompt);
+        return finishJob(jobId, { status: 'done', variacion, base64, motor: 'openai-edit' });
+      } catch (e) {
+        console.error(`Boceto 3 OpenAI edit error:`, e.message);
+      }
+      if (STABILITY_KEY) {
+        try {
+          const base64 = await stabilityImg2Img(referencia, finalPrompt, negativePrompt, variacion);
+          return finishJob(jobId, { status: 'done', variacion, base64, motor: 'stability' });
+        } catch (e2) {
+          console.error(`Boceto 3 Stability error:`, e2.message);
+        }
+      }
+      return finishJob(jobId, { status: 'error', variacion, error: 'No se pudo crear este boceto.' });
+    }
     if (referencia) {
       if (STABILITY_KEY) {
         try {
@@ -518,11 +547,69 @@ function lanzarBoceto(jobId, variacion, finalPrompt, negativePrompt, referencia)
   })();
 }
 
+// ── CLIENTES REGISTRADOS Y LÍMITE DIARIO ─────────────────────
+// La página de Shopify firma "idCliente:hora" con LUZ_SIGNING_SECRET. Solo clientes con sesión iniciada.
+function clienteVerificado(req) {
+  const id = String(req.get('X-Luz-Customer') || '');
+  const ts = String(req.get('X-Luz-Ts') || '');
+  const sig = String(req.get('X-Luz-Sig') || '').toLowerCase();
+  if (!/^\d+$/.test(id) || !/^\d+$/.test(ts) || !/^[a-f0-9]{64}$/.test(sig)) return null;
+  if (!SIGNING_SECRET) return null;
+  const edad = Math.abs(Date.now() / 1000 - Number(ts));
+  if (edad > 12 * 60 * 60) return null; // la página caduca a las 12 h: basta con recargar
+  const esperado = crypto.createHmac('sha256', SIGNING_SECRET).update(`${id}:${ts}`).digest('hex');
+  if (!crypto.timingSafeEqual(Buffer.from(esperado), Buffer.from(sig))) return null;
+  return id;
+}
+
+function soloRegistrados(req, res, next) {
+  const id = clienteVerificado(req);
+  if (!id) return res.status(401).json({ ok: false, code: 'login', error: 'Inicia sesión en tu cuenta para hablar con Luz.' });
+  req.clienteId = id;
+  next();
+}
+
+function hoyMadrid() {
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Madrid', year: 'numeric', month: '2-digit', day: '2-digit' }).format(new Date());
+}
+
+async function redis(cmd) {
+  const res = await fetch(`${REDIS_URL}/${cmd}`, { headers: { Authorization: 'Bearer ' + REDIS_TOKEN } });
+  const data = await res.json();
+  return data.result;
+}
+
+async function usosDeHoy(id) {
+  const clave = `luz:${id}:${hoyMadrid()}`;
+  if (REDIS_URL && REDIS_TOKEN) {
+    try { return parseInt(await redis(`get/${clave}`), 10) || 0; } catch (e) { console.error('redis get', e.message); }
+  }
+  return usosMemoria[clave] || 0;
+}
+
+async function sumarUso(id) {
+  const clave = `luz:${id}:${hoyMadrid()}`;
+  if (REDIS_URL && REDIS_TOKEN) {
+    try {
+      await redis(`incr/${clave}`);
+      await redis(`expire/${clave}/172800`);
+      return;
+    } catch (e) { console.error('redis incr', e.message); }
+  }
+  usosMemoria[clave] = (usosMemoria[clave] || 0) + 1;
+}
+
 // ── RUTAS ────────────────────────────────────────────────────
 app.get('/health', (req, res) => res.json({ ok: true }));
 
+// Cuántos diseños le quedan hoy al cliente
+app.get('/luz/cupo', soloRegistrados, async (req, res) => {
+  const usados = await usosDeHoy(req.clienteId);
+  res.json({ ok: true, limite: LIMITE_DIARIO, restantes: Math.max(0, LIMITE_DIARIO - usados) });
+});
+
 // 1. Conversación con Luz
-app.post('/luz/chat', limit('chat', 80, 60 * 60 * 1000), async (req, res) => {
+app.post('/luz/chat', soloRegistrados, limit('chat', 80, 60 * 60 * 1000), async (req, res) => {
   try {
     const historial = limpiarHistorial(req.body.historial);
     let recordatorio =
@@ -548,7 +635,7 @@ app.post('/luz/chat', limit('chat', 80, 60 * 60 * 1000), async (req, res) => {
 });
 
 // 2. Análisis de la foto de referencia
-app.post('/luz/analizar', limit('analizar', 15, 60 * 60 * 1000), async (req, res) => {
+app.post('/luz/analizar', soloRegistrados, limit('analizar', 15, 60 * 60 * 1000), async (req, res) => {
   try {
     const imagen = await normalizarReferencia(req.body.imagen);
     if (!imagen) return res.status(400).json({ ok: false, error: 'La imagen no es válida.' });
@@ -594,8 +681,12 @@ Reglas:
 });
 
 // 3. Preparar y lanzar los 3 bocetos
-app.post('/luz/bocetos', limit('bocetos', 4, 60 * 60 * 1000), async (req, res) => {
+app.post('/luz/bocetos', soloRegistrados, limit('bocetos', 4, 60 * 60 * 1000), async (req, res) => {
   try {
+    if ((await usosDeHoy(req.clienteId)) >= LIMITE_DIARIO) {
+      return res.status(429).json({ ok: false, code: 'limite', error: 'Ya has creado tus diseños de hoy.' });
+    }
+    await sumarUso(req.clienteId);
     const historial = limpiarHistorial(req.body.historial);
     const imagenDesc = String(req.body.imagenDesc || '').slice(0, 4000);
     const referencia = req.body.imagen ? await normalizarReferencia(req.body.imagen) : '';
@@ -626,7 +717,7 @@ app.get('/luz/resultado/:jobId', (req, res) => {
 });
 
 // 5. Enviar la solicitud con el boceto elegido a tu correo
-app.post('/luz/enviar', limit('enviar', 6, 60 * 60 * 1000), async (req, res) => {
+app.post('/luz/enviar', soloRegistrados, limit('enviar', 6, 60 * 60 * 1000), async (req, res) => {
   try {
     const { nombre, email, mensaje, resumenJoya, numeroBoceto, boceto, historial } = req.body || {};
     if (!nombre || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
