@@ -148,16 +148,18 @@ REGLAS CLAVE:
 - Haz UNA sola pregunta por mensaje.
 - No hagas interrogatorios.
 - La conversación debe sentirse natural, no como un formulario.
-FLUJO:
-1. Empieza preguntando qué tipo de joya quiere diseñar.
-2. Después pregunta si tiene una imagen de referencia (puede subirla con el botón de la imagen).
-3. Si sube referencia, la web ya pregunta automáticamente qué quiere mantener y cambiar. NO repitas esa pregunta.
-4. Después completa solo lo imprescindible:
-- ocasión o para quién
-- piedras sí/no
-- delicada o llamativa
-5. Última pregunta:
+FLUJO (en este orden, saltando lo que el cliente ya haya dicho):
+1. Qué tipo de joya quiere diseñar.
+2. Si tiene una imagen de referencia (puede subirla con el botón de la imagen).
+   Si sube referencia, la web ya pregunta automáticamente qué quiere mantener y cambiar. NO repitas esa pregunta.
+3. Qué características o elementos quiere que tenga la joya (formas, símbolos, motivos, textura...).
+   Si ya lo explicó al hablar de la referencia, no lo vuelvas a preguntar.
+4. Para qué momento especial es (aniversario, compromiso, regalo, recuerdo de alguien...).
+5. Si quiere pedrería o no. Si dice que sí, pregunta en el mismo mensaje el color o tipo de piedra.
+6. Si quiere incluir algún grabado o detalle personal: nombre, iniciales o una fecha.
+7. Última pregunta:
 "Para terminar, ¿hay algún detalle más que te gustaría añadir?"
+NUNCA preguntes si la quiere más delicada o más llamativa, ni por el estilo en general.
 Cuando tengas suficiente información, responde EXACTAMENTE:
 "¡Perfecto! Ya tengo todo lo que necesito para crear tus bocetos. Dame un momento... ✨"
 IMPORTANTE:
@@ -334,12 +336,19 @@ function construirPromptFinal(prompt, variacion, brief, usarReferencia) {
     'Variation 2: organic artisanal luxury. Softer forms, handcrafted feeling, romantic but still coherent and premium.',
     'Variation 3: bold editorial luxury. More statement, high fashion, sculptural but still manufacturable and wearable.',
   ];
+  // Con referencia, las 3 variaciones son matices de la MISMA pieza (no conceptos distintos).
+  const variacionesReferencia = [
+    'Variation 1: stay closest to the reference piece, with the client changes applied cleanly. High polish finish.',
+    'Variation 2: same piece as the reference with the client changes, slightly refined proportions and soft polished finish.',
+    'Variation 3: same piece as the reference with the client changes, with a subtle elegant detail on the finish. Keep the same single main motif, do not duplicate it.',
+  ];
+  if (usarReferencia) variationInstructions.splice(0, 3, ...variacionesReferencia);
   const forbidden = Array.isArray(brief?.materiales_prohibidos) ? brief.materiales_prohibidos : [];
   const piedras = String(brief?.piedras_finales || '').toLowerCase();
   const sinPiedras = piedras.includes('sin piedras') || piedras.includes('no piedras');
 
   const negativePrompt =
-    'blurry, low quality, distorted, deformed, ugly, watermark, logo, person, hand, finger, face, skin, cropped jewelry, partial jewelry, cut off, duplicate jewelry, multiple jewelry pieces, broken chain, melted metal, warped geometry, impossible structure, incoherent attachments, random letters, misspelled name, unreadable nameplate, malformed charm, messy charms, cheap plastic, toy jewelry, cartoon, illustration, fantasy' +
+    'blurry, low quality, distorted, deformed, ugly, watermark, logo, person, hand, finger, face, skin, cropped jewelry, partial jewelry, cut off, duplicate jewelry, duplicated motif, extra hearts, leftover engraving, random holes, multiple jewelry pieces, broken chain, melted metal, warped geometry, impossible structure, incoherent attachments, random letters, misspelled name, unreadable nameplate, malformed charm, messy charms, cheap plastic, toy jewelry, cartoon, illustration, fantasy' +
     (sinPiedras ? ', stones, gemstones, diamonds, crystals, pavé, sapphire, ruby, emerald' : '') +
     (forbidden.length ? ', ' + forbidden.join(', ') : '');
 
@@ -433,7 +442,8 @@ async function stabilityTxt2Img(prompt, negativePrompt) {
 // strength bajo = más fiel a la foto; alto = más cambios. Cada variación se aleja un poco más.
 async function stabilityImg2Img(dataUrl, prompt, negativePrompt, variacion) {
   const base64 = dataUrl.split(',')[1] || '';
-  const offsets = [-0.07, 0, 0.07];
+  // Misma intensidad en las 3: así ninguna se queda copiada ni se aleja demasiado.
+  const offsets = [0, 0, 0];
   const strength = Math.min(0.85, Math.max(0.25, STABILITY_STRENGTH + offsets[(variacion - 1) % 3]));
   const form = new FormData();
   form.append('image', new Blob([Buffer.from(base64, 'base64')], { type: 'image/png' }), 'referencia.png');
