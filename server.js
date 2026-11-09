@@ -6,7 +6,10 @@
 //
 // Variables de entorno en Render:
 //   OPENAI_API_KEY      (obligatoria)
-//   STABILITY_API_KEY   (opcional, respaldo si OpenAI falla)
+//   STABILITY_API_KEY   (obligatoria para bocetos CON foto de referencia:
+//                        Stability trabaja directamente sobre la imagen)
+//   OPENAI_IMAGE_MODEL  (opcional, por defecto "gpt-image-1.5")
+//   STABILITY_STRENGTH  (opcional, 0.30–0.80, cuánto se aleja de la foto; por defecto 0.55)
 //   RESEND_API_KEY      (para recibir las solicitudes por correo)
 //   LUZ_EMAIL_TO        (tu correo, donde llegan las solicitudes)
 //   LUZ_EMAIL_FROM      (opcional, por defecto "Luz <onboarding@resend.dev>")
@@ -19,6 +22,8 @@ const Jimp = require('jimp');
 
 const OPENAI_KEY = process.env.OPENAI_API_KEY || '';
 const STABILITY_KEY = process.env.STABILITY_API_KEY || '';
+const OPENAI_IMAGE_MODEL = process.env.OPENAI_IMAGE_MODEL || 'gpt-image-1.5';
+const STABILITY_STRENGTH = Math.min(0.8, Math.max(0.3, parseFloat(process.env.STABILITY_STRENGTH) || 0.55));
 const RESEND_KEY = process.env.RESEND_API_KEY || '';
 const EMAIL_TO = process.env.LUZ_EMAIL_TO || '';
 const EMAIL_FROM = process.env.LUZ_EMAIL_FROM || 'Luz <onboarding@resend.dev>';
@@ -335,7 +340,7 @@ function construirPromptFinal(prompt, variacion, brief, usarReferencia) {
     (forbidden.length ? ', ' + forbidden.join(', ') : '');
 
   const policy = usarReferencia
-    ? `OPENAI IMAGE EDIT MODE:
+    ? `REFERENCE IMAGE MODE:
 Use the uploaded image as the real visual reference.
 Keep the compatible visual DNA of the reference: jewelry category, general silhouette, proportions, scale, composition, material feeling and aesthetic language.
 Apply the client's requested changes as mandatory edits.
@@ -383,7 +388,7 @@ async function openaiEdit(dataUrl, prompt) {
   const res = await fetch('https://api.openai.com/v1/images/edits', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + OPENAI_KEY },
-    body: JSON.stringify({ model: 'gpt-image-1.5', images: [{ image_url: dataUrl }], prompt, n: 1, size: '1024x1024', output_format: 'png' }),
+    body: JSON.stringify({ model: OPENAI_IMAGE_MODEL, images: [{ image_url: dataUrl }], prompt, n: 1, size: '1024x1024', output_format: 'png' }),
   });
   return leerImagenOpenAI(res);
 }
@@ -392,7 +397,7 @@ async function openaiGenerate(prompt) {
   const res = await fetch('https://api.openai.com/v1/images/generations', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + OPENAI_KEY },
-    body: JSON.stringify({ model: 'gpt-image-1.5', prompt, n: 1, size: '1024x1024', output_format: 'png' }),
+    body: JSON.stringify({ model: OPENAI_IMAGE_MODEL, prompt, n: 1, size: '1024x1024', output_format: 'png' }),
   });
   return leerImagenOpenAI(res);
 }
@@ -419,6 +424,32 @@ async function stabilityTxt2Img(prompt, negativePrompt) {
   return data.artifacts[0].base64;
 }
 
+// CON REFERENCIA: Stability recibe la foto real (image-to-image) y la transforma
+// según la conversación. No se basa en una descripción de la imagen.
+// strength bajo = más fiel a la foto; alto = más cambios. Cada variación se aleja un poco más.
+async function stabilityImg2Img(dataUrl, prompt, negativePrompt, variacion) {
+  const base64 = dataUrl.split(',')[1] || '';
+  const offsets = [-0.08, 0, 0.08];
+  const strength = Math.min(0.85, Math.max(0.25, STABILITY_STRENGTH + offsets[(variacion - 1) % 3]));
+  const form = new FormData();
+  form.append('image', new Blob([Buffer.from(base64, 'base64')], { type: 'image/png' }), 'referencia.png');
+  form.append('mode', 'image-to-image');
+  form.append('strength', String(strength));
+  form.append('prompt', prompt.slice(0, 9000));
+  form.append('negative_prompt', negativePrompt.slice(0, 9000));
+  form.append('output_format', 'png');
+  // fetch nativo de Node 18 (admite FormData)
+  const res = await globalThis.fetch('https://api.stability.ai/v2beta/stable-image/generate/sd3', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + STABILITY_KEY, Accept: 'application/json' },
+    body: form,
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  if (!data.image) throw new Error('Sin imagen de Stability');
+  return data.image;
+}
+
 function createJob(variacion) {
   const jobId = `luz_${Date.now()}_${variacion}_${Math.floor(Math.random() * 100000)}`;
   jobs[jobId] = { status: 'processing', variacion };
@@ -432,21 +463,44 @@ function finishJob(jobId, payload) {
 
 function lanzarBoceto(jobId, variacion, finalPrompt, negativePrompt, referencia) {
   (async () => {
-    try {
-      const base64 = referencia ? await openaiEdit(referencia, finalPrompt) : await openaiGenerate(finalPrompt);
-      finishJob(jobId, { status: 'done', variacion, base64 });
-    } catch (e) {
-      console.error(`Boceto ${variacion} OpenAI error:`, e.message);
+    // Camino 1 — CON referencia: Stability ve la foto y la transforma.
+    if (referencia) {
       if (STABILITY_KEY) {
         try {
-          const base64 = await stabilityTxt2Img(finalPrompt, negativePrompt);
-          return finishJob(jobId, { status: 'done', variacion, base64 });
-        } catch (e2) {
-          console.error(`Boceto ${variacion} Stability error:`, e2.message);
+          const base64 = await stabilityImg2Img(referencia, finalPrompt, negativePrompt, variacion);
+          return finishJob(jobId, { status: 'done', variacion, base64, motor: 'stability' });
+        } catch (e) {
+          console.error(`Boceto ${variacion} Stability (referencia) error:`, e.message);
         }
+      } else {
+        console.error('Falta STABILITY_API_KEY: se usa OpenAI con la foto como respaldo.');
       }
-      finishJob(jobId, { status: 'error', variacion, error: 'No se pudo crear este boceto.' });
+      // Respaldo: OpenAI también recibe la foto real (no una descripción).
+      try {
+        const base64 = await openaiEdit(referencia, finalPrompt);
+        return finishJob(jobId, { status: 'done', variacion, base64, motor: 'openai-edit' });
+      } catch (e2) {
+        console.error(`Boceto ${variacion} OpenAI edit error:`, e2.message);
+      }
+      return finishJob(jobId, { status: 'error', variacion, error: 'No se pudo crear este boceto.' });
     }
+
+    // Camino 2 — SIN referencia: OpenAI crea el boceto desde la conversación.
+    try {
+      const base64 = await openaiGenerate(finalPrompt);
+      return finishJob(jobId, { status: 'done', variacion, base64, motor: 'openai' });
+    } catch (e) {
+      console.error(`Boceto ${variacion} OpenAI error:`, e.message);
+    }
+    if (STABILITY_KEY) {
+      try {
+        const base64 = await stabilityTxt2Img(finalPrompt, negativePrompt);
+        return finishJob(jobId, { status: 'done', variacion, base64, motor: 'stability-txt' });
+      } catch (e2) {
+        console.error(`Boceto ${variacion} Stability error:`, e2.message);
+      }
+    }
+    finishJob(jobId, { status: 'error', variacion, error: 'No se pudo crear este boceto.' });
   })();
 }
 
