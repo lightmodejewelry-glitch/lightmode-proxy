@@ -1,4 +1,4 @@
-============================================================
+// ============================================================
 // LightMode — Servidor de Luz (Render)
 // Reúne en un solo sitio lo que antes hacían el backend de Wix
 // y el proxy de Render. Las claves viven SOLO en las variables
