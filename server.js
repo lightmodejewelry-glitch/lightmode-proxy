@@ -414,37 +414,46 @@ async function leerImagenOpenAI(res) {
   throw new Error('OpenAI no devolvió imagen');
 }
 
-// Edición con OpenAI conservando al máximo la foto (solo cambia lo que se pide).
-async function openaiEditFiel(dataUrl, prompt) {
-  const body = { model: OPENAI_IMAGE_MODEL, images: [{ image_url: dataUrl }], prompt, n: 1, size: '1024x1024', output_format: 'png', input_fidelity: 'high' };
-  let res = await fetch('https://api.openai.com/v1/images/edits', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + OPENAI_KEY },
-    body: JSON.stringify(body),
-  });
-  if (res.status === 400) {
+// OpenAI edita la FOTO REAL: se envía como archivo (multipart). Así sí la ve.
+async function openaiEditarFoto(dataUrl, prompt, fiel) {
+  const base64 = dataUrl.split(',')[1] || '';
+  const enviar = async (conFidelidad) => {
+    const form = new FormData();
+    form.append('model', OPENAI_IMAGE_MODEL);
+    form.append('image', new Blob([Buffer.from(base64, 'base64')], { type: 'image/png' }), 'referencia.png');
+    form.append('prompt', prompt.slice(0, 30000));
+    form.append('n', '1');
+    form.append('size', '1024x1024');
+    if (conFidelidad) form.append('input_fidelity', 'high');
+    return globalThis.fetch('https://api.openai.com/v1/images/edits', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + OPENAI_KEY },
+      body: form,
+    });
+  };
+  let res = await enviar(fiel);
+  if (!res.ok && fiel) {
     const txt = await res.text();
-    if (/input_fidelity/i.test(txt)) {
-      delete body.input_fidelity;
-      res = await fetch('https://api.openai.com/v1/images/edits', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + OPENAI_KEY },
-        body: JSON.stringify(body),
-      });
-    } else {
-      throw new Error(txt);
-    }
+    if (!/input_fidelity/i.test(txt)) throw new Error(txt);
+    res = await enviar(false);
   }
-  return leerImagenOpenAI(res);
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  const item = data?.data?.[0];
+  if (item?.b64_json) return item.b64_json;
+  if (item?.url) {
+    const img = await fetch(item.url);
+    return (await img.buffer()).toString('base64');
+  }
+  throw new Error('OpenAI no devolvió imagen');
+}
+
+async function openaiEditFiel(dataUrl, prompt) {
+  return openaiEditarFoto(dataUrl, prompt, true);
 }
 
 async function openaiEdit(dataUrl, prompt) {
-  const res = await fetch('https://api.openai.com/v1/images/edits', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + OPENAI_KEY },
-    body: JSON.stringify({ model: OPENAI_IMAGE_MODEL, images: [{ image_url: dataUrl }], prompt, n: 1, size: '1024x1024', output_format: 'png' }),
-  });
-  return leerImagenOpenAI(res);
+  return openaiEditarFoto(dataUrl, prompt, true);
 }
 
 async function openaiGenerate(prompt) {
@@ -516,12 +525,17 @@ async function planearCambios(brief, historial) {
       {
         role: 'system',
         content: `You convert a jewelry client's requested changes into precise photo edits.
-Return JSON: {"ediciones":[{"buscar":"...","reemplazar":"...","texto":false}]}
-- "texto": true ONLY when the edit is about letters, names, initials, words or numbers; false for shapes, charms, stones, textures.
+Return JSON: {"ediciones":[{"tipo":"cambiar","buscar":"...","reemplazar":"..."}]}
+- "tipo":
+  "cambiar" = an element that EXISTS in the photo becomes a different element (e.g. flower charm → clover charm),
+  "quitar" = remove an existing element (e.g. flame engraving → smooth surface),
+  "anadir" = add something new that has no counterpart in the photo (e.g. a small clover engraved below the name),
+  "texto" = anything with letters, names, initials, words or numbers (changing, adding or removing).
 - "buscar": short English description of the element that EXISTS in the reference photo (e.g. "flower charm", "letters NOA", "flame engraving on the heart").
 - "reemplazar": short English description of what must be there instead, in the same material, size, style and position (e.g. "four-leaf clover charm in the same polished silver", "the letters MARTA in the same silver letter-bead style"). For removals, describe the clean surface (e.g. "smooth polished gold surface").
 - Only include changes the client explicitly asked for. Keep everything else. Maximum 4 edits. Ignore occasion and other non-visual info.
-- Added elements with no existing counterpart: use "buscar" = the closest existing area where it must go (e.g. "center of the heart") and describe the result.`,
+- For "anadir" and "texto", "buscar" is WHERE it goes (e.g. "on the heart, below the name") and "reemplazar" is WHAT to add.
+- "buscar" for "cambiar"/"quitar" must name only that small element, never the whole piece or its main shape.`,
       },
       {
         role: 'user',
@@ -534,7 +548,11 @@ Return JSON: {"ediciones":[{"buscar":"...","reemplazar":"...","texto":false}]}
   return lista
     .filter((e) => e && e.buscar && e.reemplazar)
     .slice(0, 4)
-    .map((e) => ({ buscar: String(e.buscar).slice(0, 200), reemplazar: String(e.reemplazar).slice(0, 400), texto: e.texto === true }));
+    .map((e) => {
+      const tipo = ['cambiar', 'quitar', 'anadir', 'texto'].includes(e.tipo) ? e.tipo : 'cambiar';
+      // Stability solo cambia/quita lo que existe; añadir y letras van a OpenAI con la foto real.
+      return { tipo, buscar: String(e.buscar).slice(0, 200), reemplazar: String(e.reemplazar).slice(0, 400), texto: tipo === 'texto' || tipo === 'anadir' };
+    });
 }
 
 // FUSIÓN — paso 2: Stability busca ese elemento en la foto real y solo cambia esa zona.
@@ -568,11 +586,11 @@ async function bocetoFusion(referencia, ediciones, variacion, negativePrompt) {
   // 2) Letras y nombres → OpenAI, tocando solo las letras.
   const textos = ediciones.filter((x) => x.texto);
   if (textos.length) {
-    const cambios = textos.map((t) => `- Replace ${t.buscar} with ${t.reemplazar}.`).join('\n');
-    const prompt = `Edit this jewelry photo. Change ONLY the lettering:
+    const cambios = textos.map((t) => (t.tipo === 'anadir' ? `- Add ${t.reemplazar} (${t.buscar}).` : `- ${t.buscar}: ${t.reemplazar}.`)).join('\n');
+    const prompt = `Edit this exact jewelry photo. Apply ONLY these changes:
 ${cambios}
-Spell the new letters exactly, each letter clearly readable, same letter style, size, material and spacing as the original letters.
-Keep EVERYTHING else exactly identical: same jewelry piece, chain, charms, clasp, materials, background, props, lighting, camera angle and framing. Do not add or remove anything else.`;
+Spell any letters exactly as written, each letter clearly readable; if the photo already had letters keep their style, otherwise make them engraved in the same metal.
+Keep EVERYTHING else exactly identical to the photo: same jewelry piece and type, same shape, same metal, same background, lighting, camera angle and framing. Do not add or remove anything else.`;
     try {
       base64 = await openaiEditFiel(`data:image/png;base64,${base64}`, prompt);
     } catch (e) {
