@@ -16,6 +16,11 @@
 //   ALLOWED_ORIGINS     (opcional, webs que pueden usar a Luz, separadas por comas)
 //   LUZ_SIGNING_SECRET  (obligatoria: la misma clave de firma que usa la página de Shopify)
 //   LUZ_LIMITE_DIARIO   (opcional, diseños por cliente y día; por defecto 2)
+//   LUZ_MOTOR_REFERENCIA (opcional, bocetos CON foto:
+//                        "fusion" (por defecto) = OpenAI convierte la conversación en cambios concretos
+//                          y Stability los aplica sobre la foto real, sin tocar el resto;
+//                        "openai" = los 3 con OpenAI redibujando la foto;
+//                        "mixto" = 1 y 2 con Stability, 3 con OpenAI)
 //   UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN (opcionales: guardan el contador
 //                        aunque Render se reinicie; sin ellas el contador vive en memoria)
 // ============================================================
@@ -42,6 +47,7 @@ const LIMITE_DIARIO = parseInt(process.env.LUZ_LIMITE_DIARIO, 10) || 2;
 const REDIS_URL = (process.env.UPSTASH_REDIS_REST_URL || '').replace(/\/$/, '');
 const REDIS_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN || '';
 const usosMemoria = {};
+const MOTOR_REFERENCIA = (process.env.LUZ_MOTOR_REFERENCIA || 'fusion').toLowerCase();
 
 const app = express();
 const jobs = {};
@@ -349,8 +355,8 @@ function construirPromptFinal(prompt, variacion, brief, usarReferencia) {
   ];
   // Con referencia, las 3 variaciones son matices de la MISMA pieza (no conceptos distintos).
   const variacionesReferencia = [
-    'Variation 1: stay closest to the reference piece, with the client changes applied cleanly. High polish finish.',
-    'Variation 2: same piece as the reference with the client changes, slightly refined proportions and soft polished finish.',
+    'Variation 1: stay closest to the reference piece, but apply EVERY client change clearly (replaced names, letters, symbols, stones or elements exactly as requested). High polish finish.',
+    'Variation 2: same piece as the reference with EVERY client change applied clearly, slightly refined proportions and soft polished finish.',
     'Variation 3: keep the reference piece recognizable, but apply EVERY client change clearly and visibly, including any added letters, stones, symbols or new elements exactly where the client asked. Keep the same single main motif, do not duplicate it.',
   ];
   if (usarReferencia) variationInstructions.splice(0, 3, ...variacionesReferencia);
@@ -406,6 +412,30 @@ async function leerImagenOpenAI(res) {
     return (await img.buffer()).toString('base64');
   }
   throw new Error('OpenAI no devolvió imagen');
+}
+
+// Edición con OpenAI conservando al máximo la foto (solo cambia lo que se pide).
+async function openaiEditFiel(dataUrl, prompt) {
+  const body = { model: OPENAI_IMAGE_MODEL, images: [{ image_url: dataUrl }], prompt, n: 1, size: '1024x1024', output_format: 'png', input_fidelity: 'high' };
+  let res = await fetch('https://api.openai.com/v1/images/edits', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + OPENAI_KEY },
+    body: JSON.stringify(body),
+  });
+  if (res.status === 400) {
+    const txt = await res.text();
+    if (/input_fidelity/i.test(txt)) {
+      delete body.input_fidelity;
+      res = await fetch('https://api.openai.com/v1/images/edits', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + OPENAI_KEY },
+        body: JSON.stringify(body),
+      });
+    } else {
+      throw new Error(txt);
+    }
+  }
+  return leerImagenOpenAI(res);
 }
 
 async function openaiEdit(dataUrl, prompt) {
@@ -475,6 +505,84 @@ async function stabilityImg2Img(dataUrl, prompt, negativePrompt, variacion) {
   return data.image;
 }
 
+// FUSIÓN — paso 1: OpenAI lee la conversación y la convierte en cambios concretos
+// ("qué buscar en la foto" → "por qué cambiarlo"). No toca la imagen.
+async function planearCambios(brief, historial) {
+  const content = await openaiChat({
+    model: 'gpt-4o-mini',
+    temperature: 0.2,
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content: `You convert a jewelry client's requested changes into precise photo edits.
+Return JSON: {"ediciones":[{"buscar":"...","reemplazar":"...","texto":false}]}
+- "texto": true ONLY when the edit is about letters, names, initials, words or numbers; false for shapes, charms, stones, textures.
+- "buscar": short English description of the element that EXISTS in the reference photo (e.g. "flower charm", "letters NOA", "flame engraving on the heart").
+- "reemplazar": short English description of what must be there instead, in the same material, size, style and position (e.g. "four-leaf clover charm in the same polished silver", "the letters MARTA in the same silver letter-bead style"). For removals, describe the clean surface (e.g. "smooth polished gold surface").
+- Only include changes the client explicitly asked for. Keep everything else. Maximum 4 edits. Ignore occasion and other non-visual info.
+- Added elements with no existing counterpart: use "buscar" = the closest existing area where it must go (e.g. "center of the heart") and describe the result.`,
+      },
+      {
+        role: 'user',
+        content: `BRIEF:\n${JSON.stringify(brief || {})}\n\nCONVERSACIÓN:\n${historialATexto(historial).slice(-6000)}`,
+      },
+    ],
+  });
+  const data = safeJsonParse(content) || {};
+  const lista = Array.isArray(data.ediciones) ? data.ediciones : [];
+  return lista
+    .filter((e) => e && e.buscar && e.reemplazar)
+    .slice(0, 4)
+    .map((e) => ({ buscar: String(e.buscar).slice(0, 200), reemplazar: String(e.reemplazar).slice(0, 400), texto: e.texto === true }));
+}
+
+// FUSIÓN — paso 2: Stability busca ese elemento en la foto real y solo cambia esa zona.
+async function stabilityBuscarYReemplazar(base64, buscar, reemplazar, seed, negativePrompt) {
+  const form = new FormData();
+  form.append('image', new Blob([Buffer.from(base64, 'base64')], { type: 'image/png' }), 'foto.png');
+  form.append('search_prompt', buscar);
+  form.append('prompt', `${reemplazar}. Realistic premium jewelry, same lighting, same background, same material and finish as the rest of the piece.`);
+  form.append('negative_prompt', String(negativePrompt || '').slice(0, 2000));
+  form.append('seed', String(seed));
+  form.append('grow_mask', '6');
+  form.append('output_format', 'png');
+  const res = await globalThis.fetch('https://api.stability.ai/v2beta/stable-image/edit/search-and-replace', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + STABILITY_KEY, Accept: 'application/json' },
+    body: form,
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const data = await res.json();
+  if (!data.image) throw new Error('Sin imagen de Stability (search-and-replace)');
+  return data.image;
+}
+
+async function bocetoFusion(referencia, ediciones, variacion, negativePrompt) {
+  let base64 = referencia.split(',')[1] || '';
+  const seed = Math.floor(Math.random() * 4000000000);
+  // 1) Formas, adornos, piedras, texturas → Stability sobre la foto real.
+  for (const e of ediciones.filter((x) => !x.texto)) {
+    base64 = await stabilityBuscarYReemplazar(base64, e.buscar, e.reemplazar, seed + variacion, negativePrompt);
+  }
+  // 2) Letras y nombres → OpenAI, tocando solo las letras.
+  const textos = ediciones.filter((x) => x.texto);
+  if (textos.length) {
+    const cambios = textos.map((t) => `- Replace ${t.buscar} with ${t.reemplazar}.`).join('\n');
+    const prompt = `Edit this jewelry photo. Change ONLY the lettering:
+${cambios}
+Spell the new letters exactly, each letter clearly readable, same letter style, size, material and spacing as the original letters.
+Keep EVERYTHING else exactly identical: same jewelry piece, chain, charms, clasp, materials, background, props, lighting, camera angle and framing. Do not add or remove anything else.`;
+    try {
+      base64 = await openaiEditFiel(`data:image/png;base64,${base64}`, prompt);
+    } catch (e) {
+      console.error(`Boceto ${variacion} letras (OpenAI) error:`, e.message);
+      if (!ediciones.some((x) => !x.texto)) throw e; // sin otros cambios: que actúe el respaldo
+    }
+  }
+  return base64;
+}
+
 function createJob(variacion) {
   const jobId = `luz_${Date.now()}_${variacion}_${Math.floor(Math.random() * 100000)}`;
   jobs[jobId] = { status: 'processing', variacion };
@@ -486,23 +594,41 @@ function finishJob(jobId, payload) {
   setTimeout(() => delete jobs[jobId], 15 * 60 * 1000);
 }
 
-function lanzarBoceto(jobId, variacion, finalPrompt, negativePrompt, referencia) {
+function lanzarBoceto(jobId, variacion, finalPrompt, negativePrompt, referencia, ediciones = []) {
   (async () => {
+    // Camino FUSIÓN (por defecto con foto): OpenAI decide los cambios, Stability edita la foto real.
+    if (referencia && MOTOR_REFERENCIA === 'fusion' && STABILITY_KEY) {
+      try {
+        const base64 = ediciones.length
+          ? await bocetoFusion(referencia, ediciones, variacion, negativePrompt)
+          : await stabilityImg2Img(referencia, finalPrompt, negativePrompt, variacion);
+        return finishJob(jobId, { status: 'done', variacion, base64, motor: ediciones.length ? 'fusion' : 'stability' });
+      } catch (e) {
+        console.error(`Boceto ${variacion} fusión error:`, e.message);
+      }
+      try {
+        const base64 = await openaiEdit(referencia, finalPrompt);
+        return finishJob(jobId, { status: 'done', variacion, base64, motor: 'openai-edit' });
+      } catch (e2) {
+        console.error(`Boceto ${variacion} OpenAI edit error:`, e2.message);
+      }
+      return finishJob(jobId, { status: 'error', variacion, error: 'No se pudo crear este boceto.' });
+    }
     // Camino 1 — CON referencia. Bocetos 1 y 2: Stability (fiel a la foto).
     // Boceto 3: OpenAI editando la foto real (añade mejor letras, piedras y elementos nuevos).
-    if (referencia && variacion === 3) {
+    if (referencia && (MOTOR_REFERENCIA === 'openai' || MOTOR_REFERENCIA === 'fusion' || variacion === 3)) {
       try {
         const base64 = await openaiEdit(referencia, finalPrompt);
         return finishJob(jobId, { status: 'done', variacion, base64, motor: 'openai-edit' });
       } catch (e) {
-        console.error(`Boceto 3 OpenAI edit error:`, e.message);
+        console.error(`Boceto ${variacion} OpenAI edit error:`, e.message);
       }
       if (STABILITY_KEY) {
         try {
           const base64 = await stabilityImg2Img(referencia, finalPrompt, negativePrompt, variacion);
           return finishJob(jobId, { status: 'done', variacion, base64, motor: 'stability' });
         } catch (e2) {
-          console.error(`Boceto 3 Stability error:`, e2.message);
+          console.error(`Boceto ${variacion} Stability error:`, e2.message);
         }
       }
       return finishJob(jobId, { status: 'error', variacion, error: 'No se pudo crear este boceto.' });
@@ -694,12 +820,21 @@ app.post('/luz/bocetos', soloRegistrados, limit('bocetos', 4, 60 * 60 * 1000), a
 
     const brief = await extraerBriefFinal(historial, imagenDesc, tieneReferencia);
     const prompts = await generarPrompts(brief, imagenDesc, tieneReferencia);
+    let ediciones = [];
+    if (tieneReferencia && MOTOR_REFERENCIA === 'fusion') {
+      try {
+        ediciones = await planearCambios(brief, historial);
+        console.log('Fusión, cambios:', JSON.stringify(ediciones));
+      } catch (e) {
+        console.error('planearCambios error:', e.message);
+      }
+    }
 
     const jobIds = prompts.map((prompt, i) => {
       const variacion = i + 1;
       const jobId = createJob(variacion);
       const { finalPrompt, negativePrompt } = construirPromptFinal(prompt, variacion, brief, tieneReferencia);
-      lanzarBoceto(jobId, variacion, finalPrompt, negativePrompt, referencia);
+      lanzarBoceto(jobId, variacion, finalPrompt, negativePrompt, referencia, ediciones);
       return jobId;
     });
 
