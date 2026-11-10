@@ -922,5 +922,53 @@ app.post('/luz/enviar', soloRegistrados, limit('enviar', 6, 60 * 60 * 1000), asy
   }
 });
 
+
+// 6. Formulario de contacto con fotos de referencia (página de contacto de la tienda)
+app.post('/contacto', limit('contacto', 5, 60 * 60 * 1000), async (req, res) => {
+  try {
+    const { nombre, email, telefono, mensaje, referencias } = req.body || {};
+    if (!nombre || !email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || !mensaje) {
+      return res.status(400).json({ ok: false, error: 'Faltan el nombre, un email válido o el mensaje.' });
+    }
+    if (!RESEND_KEY || !EMAIL_TO) {
+      return res.status(500).json({ ok: false, error: 'El envío aún no está configurado.' });
+    }
+    const fotos = (Array.isArray(referencias) ? referencias : [])
+      .filter((f) => f && typeof f.data === 'string' && /^data:image\/(png|jpe?g|webp);base64,/.test(f.data))
+      .slice(0, 3);
+    const attachments = fotos.map((f, i) => ({
+      filename: String(f.name || `referencia-${i + 1}.jpg`).replace(/[^\w.\-]/g, '_').slice(0, 80),
+      content: f.data.replace(/^data:image\/[\w+]+;base64,/, ''),
+    }));
+    const html = `
+      <h2>Nuevo mensaje desde la página de contacto</h2>
+      <p><strong>Nombre:</strong> ${escapeHtml(nombre)}<br>
+      <strong>Email:</strong> ${escapeHtml(email)}<br>
+      <strong>Teléfono:</strong> ${escapeHtml(telefono || '—')}</p>
+      <p><strong>Mensaje:</strong><br>${escapeHtml(mensaje).replace(/\n/g, '<br>')}</p>
+      <p>${attachments.length ? `Van adjuntas ${attachments.length} foto(s) de referencia.` : 'Sin fotos de referencia.'}</p>`;
+    const r = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + RESEND_KEY },
+      body: JSON.stringify({
+        from: EMAIL_FROM,
+        to: EMAIL_TO.split(',').map((s) => s.trim()),
+        reply_to: email,
+        subject: `Contacto web · ${String(nombre).slice(0, 80)}`,
+        html,
+        attachments,
+      }),
+    });
+    if (!r.ok) {
+      console.error('resend contacto error:', await r.text());
+      return res.status(500).json({ ok: false, error: 'No se ha podido enviar el mensaje.' });
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    console.error('contacto error:', e.message);
+    res.status(500).json({ ok: false, error: 'No se ha podido enviar el mensaje.' });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log('Servidor de Luz en puerto', PORT));
